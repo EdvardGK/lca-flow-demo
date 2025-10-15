@@ -21,7 +21,7 @@ import sys
 from ifc_sync_simple import SimpleIFCSync
 
 st.set_page_config(
-    page_title="BIM LCA Dashboard",
+    page_title="BIM LCA-verktøy",
     page_icon="🏗️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -66,13 +66,20 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Detect deployment environment
+def is_cloud_deployment():
+    """Detect if running on Streamlit Cloud"""
+    import os
+    # Streamlit Cloud sets these environment variables
+    return os.getenv('STREAMLIT_SHARING_MODE') is not None or \
+           os.getenv('STREAMLIT_SERVER_HEADLESS') == 'true'
+
 # Initialize session state
 if 'sync' not in st.session_state:
-    # Use folders relative to script location
-    st.session_state.sync = SimpleIFCSync(input_folder="input", output_folder="output")
-
-if 'current_excel' not in st.session_state:
-    st.session_state.current_excel = None
+    # Auto-detect environment
+    use_temp = is_cloud_deployment()
+    st.session_state.sync = SimpleIFCSync(input_folder="input", output_folder="output", use_temp=use_temp)
+    st.session_state.is_cloud = use_temp
 
 if 'current_analysis_ifc' not in st.session_state:
     st.session_state.current_analysis_ifc = None
@@ -80,13 +87,15 @@ if 'current_analysis_ifc' not in st.session_state:
 if 'df' not in st.session_state:
     st.session_state.df = None
 
+# Processing state management
+if 'is_processing' not in st.session_state:
+    st.session_state.is_processing = False
 
-def load_excel_data(excel_path: Path):
-    """Load Excel data into session state"""
-    df = pd.read_excel(excel_path)
-    st.session_state.df = df
-    st.session_state.current_excel = excel_path
-    return df
+if 'progress_value' not in st.session_state:
+    st.session_state.progress_value = 0
+
+if 'progress_message' not in st.session_state:
+    st.session_state.progress_message = ""
 
 
 def extract_volume_from_properties(df: pd.DataFrame) -> pd.DataFrame:
@@ -104,15 +113,21 @@ def extract_volume_from_properties(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def extract_mmi_code(df: pd.DataFrame) -> pd.DataFrame:
-    """Extract MMI code from property columns"""
-    # Look for MMI-related columns
-    mmi_cols = [col for col in df.columns if 'MMI' in col.upper()]
+def extract_gjenbruksstatus(df: pd.DataFrame) -> pd.DataFrame:
+    """Extract or create Gjenbruksstatus column for analysis"""
+    gjenbruk_col = 'G55_LCA.Gjenbruksstatus'
 
-    if mmi_cols:
-        df['MMI_Code'] = df[mmi_cols[0]]
+    # If column already exists, use it
+    if gjenbruk_col in df.columns:
+        df['Gjenbruksstatus'] = df[gjenbruk_col].fillna('NY')
     else:
-        df['MMI_Code'] = 'Unknown'
+        # Try to find MMI codes and map them
+        mmi_cols = [col for col in df.columns if 'MMI' in col.upper()]
+        if mmi_cols:
+            df['Gjenbruksstatus'] = df[mmi_cols[0]].apply(map_mmi_to_status)
+        else:
+            # Default to NY
+            df['Gjenbruksstatus'] = 'NY'
 
     return df
 
@@ -122,15 +137,29 @@ def map_mmi_to_status(mmi_code):
     try:
         mmi_num = int(float(str(mmi_code)))
         mapping = {
-            300: "NY (Nytt)",
-            700: "EKS (Eksisterende)",
-            800: "GJEN (Gjenbruk)"
+            300: "NY",
+            700: "EKS",
+            800: "GJEN"
         }
-        return mapping.get(mmi_num, f"Annet ({mmi_num})")
+        return mapping.get(mmi_num, "NY")
     except (ValueError, TypeError):
         if pd.isna(mmi_code) or str(mmi_code).strip() == "":
-            return "Ikke angitt"
-        return str(mmi_code)
+            return "NY"
+        # If it's already NY/EKS/GJEN, return as-is
+        status_str = str(mmi_code).strip().upper()
+        if status_str in ['NY', 'EKS', 'GJEN']:
+            return status_str
+        return "NY"
+
+
+def map_status_to_display(status):
+    """Map status code to display name"""
+    mapping = {
+        'NY': 'NY (Nytt)',
+        'EKS': 'EKS (Eksisterende)',
+        'GJEN': 'GJEN (Gjenbruk)'
+    }
+    return mapping.get(status, 'Ikke angitt')
 
 
 # =============================================================================
@@ -141,177 +170,244 @@ with st.sidebar:
     st.markdown('<h1 style="color: #2E7D32;">🏗️ BIM LCA</h1>', unsafe_allow_html=True)
     st.markdown("**Klimagassregnskap for byggeprosjekter**")
 
+    # Show deployment mode
+    if st.session_state.is_cloud:
+        st.info("☁️ **Cloud Mode**: Download analysis IFC to use with Solibri")
+    else:
+        st.success("💻 **Local Mode**: Solibri can watch analysis IFC for live updates")
+
     st.markdown("---")
+
+    # Show processing warning if active
+    if st.session_state.is_processing:
+        st.warning("⚠️ Behandler fil - vennligst vent...")
+        st.markdown("**Ikke lukk vinduet eller klikk på andre knapper**")
+        st.markdown("---")
 
     # File upload section
-    st.subheader("📁 Load IFC File")
+    st.subheader("📁 Last opp IFC-fil")
 
-    # List available IFC files
-    script_dir = Path(__file__).parent
-    ifc_files = list((script_dir / "input").glob("*.ifc"))
+    # Option 1: Upload IFC file (for Streamlit Cloud)
+    uploaded_file = st.file_uploader(
+        "Last opp IFC-fil fra din datamaskin",
+        type=['ifc'],
+        help="Velg en IFC-fil for analyse",
+        disabled=st.session_state.is_processing
+    )
 
-    if ifc_files:
-        selected_ifc = st.selectbox(
-            "Select IFC file",
-            options=[f.name for f in ifc_files],
-            key="ifc_selector"
-        )
+    if uploaded_file is not None:
+        # Save uploaded file to input folder
+        script_dir = Path(__file__).parent
+        input_path = script_dir / "input" / uploaded_file.name
 
-        if st.button("🔄 Extract IFC to Excel", type="primary"):
-            with st.spinner("Extracting IFC data..."):
-                result = st.session_state.sync.run_workflow(selected_ifc)
+        with open(input_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-                if result:
-                    st.session_state.current_excel = result['excel']
-                    st.session_state.current_analysis_ifc = result['analysis_ifc']
-                    st.session_state.df = result['dataframe']
-                    st.success(f"✅ Extracted {len(result['dataframe'])} elements")
-                    st.rerun()
-    else:
-        st.info("📂 Place IFC files in the `input/` folder")
+        st.success(f"📥 Lastet opp: {uploaded_file.name}")
 
-    st.markdown("---")
+        # Auto-generate filenames based on uploaded file
+        default_basename = Path(uploaded_file.name).stem
+        excel_filename = f"{default_basename}.xlsx"
+        analysis_ifc_filename = f"{default_basename}_analyse.ifc"
 
-    # Excel file selector
-    st.subheader("📊 Load Excel")
+        if st.button("🔄 Analyser modell", type="primary", key="extract_uploaded",
+                     disabled=st.session_state.is_processing):
+            st.session_state.is_processing = True
 
-    script_dir = Path(__file__).parent
-    excel_files = list((script_dir / "output").glob("*.xlsx"))
+            # Create progress containers
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-    if excel_files:
-        selected_excel = st.selectbox(
-            "Select Excel file",
-            options=[f.name for f in excel_files],
-            key="excel_selector"
-        )
+            def update_progress(current, total, message):
+                """Progress callback for extraction"""
+                progress_bar.progress(current / total if total > 0 else 0)
+                status_text.text(message)
 
-        if st.button("📂 Load Excel"):
-            script_dir = Path(__file__).parent
-            excel_path = script_dir / "output" / selected_excel
-            df = load_excel_data(excel_path)
-            st.success(f"✅ Loaded {len(df)} rows")
-            st.rerun()
-
-    st.markdown("---")
-
-    # Sync section
-    if st.session_state.current_excel and st.session_state.current_analysis_ifc:
-        st.subheader("🔄 Sync to IFC")
-
-        st.info(f"**Excel:** {st.session_state.current_excel.name}")
-        st.info(f"**Analysis IFC:** {st.session_state.current_analysis_ifc.name}")
-
-        if st.button("💾 Sync Excel → IFC", type="primary"):
-            with st.spinner("Syncing changes..."):
-                success = st.session_state.sync.sync_excel_to_ifc(
-                    st.session_state.current_excel,
-                    st.session_state.current_analysis_ifc
+            try:
+                result = st.session_state.sync.run_workflow(
+                    uploaded_file.name,
+                    progress_callback=update_progress,
+                    excel_filename=excel_filename,
+                    analysis_ifc_filename=analysis_ifc_filename
                 )
 
-                if success:
-                    st.success("✅ Sync complete!")
-                else:
-                    st.error("❌ Sync failed")
+                if result:
+                    st.session_state.current_analysis_ifc = result['analysis_ifc']
+                    st.session_state.df = result['dataframe']
+                    st.success(f"✅ Ekstrahert {len(result['dataframe'])} elementer")
+                    st.info(f"📁 Analyse-IFC lagret i: {result['analysis_ifc']}")
+                    st.session_state.is_processing = False
+                    st.rerun()
+            except Exception as e:
+                st.error(f"❌ Feil under ekstraksjon: {e}")
+                st.session_state.is_processing = False
+                st.rerun()
+
+    # Developer mode: Local file selection (hidden by default)
+    with st.expander("🔧 Utvikler: Bruk lokal fil", expanded=False):
+        script_dir = Path(__file__).parent
+        ifc_files = list((script_dir / "input").glob("*.ifc"))
+
+        if ifc_files:
+            selected_ifc = st.selectbox(
+                "Velg eksisterende IFC-fil",
+                options=[f.name for f in ifc_files],
+                key="ifc_selector",
+                disabled=st.session_state.is_processing
+            )
+
+            # Auto-generate filenames based on selected file
+            default_basename = Path(selected_ifc).stem
+            excel_filename_selected = f"{default_basename}.xlsx"
+            analysis_ifc_filename_selected = f"{default_basename}_analyse.ifc"
+
+            if st.button("🔄 Analyser valgt fil", type="primary", key="extract_selected",
+                         disabled=st.session_state.is_processing):
+                st.session_state.is_processing = True
+
+                # Create progress containers
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                def update_progress(current, total, message):
+                    """Progress callback for extraction"""
+                    progress_bar.progress(current / total if total > 0 else 0)
+                    status_text.text(message)
+
+                try:
+                    result = st.session_state.sync.run_workflow(
+                        selected_ifc,
+                        progress_callback=update_progress,
+                        excel_filename=excel_filename_selected,
+                        analysis_ifc_filename=analysis_ifc_filename_selected
+                    )
+
+                    if result:
+                        st.session_state.current_analysis_ifc = result['analysis_ifc']
+                        st.session_state.df = result['dataframe']
+                        st.success(f"✅ Ekstrahert {len(result['dataframe'])} elementer")
+                        st.info(f"📁 Analyse-IFC lagret i: {result['analysis_ifc']}")
+                        st.session_state.is_processing = False
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Feil under ekstraksjon: {e}")
+                    st.session_state.is_processing = False
+                    st.rerun()
+        else:
+            st.info("📂 Ingen IFC-filer funnet i input-mappen")
+
+    st.markdown("---")
+
+    # Optional download section
+    if st.session_state.current_analysis_ifc:
+        st.subheader("📥 Eksporter filer")
+
+        st.caption("💡 Analyse-IFC oppdateres automatisk. Excel genereres kun på forespørsel.")
+
+        # Show analysis IFC location
+        st.info(f"📁 Analyse-IFC: `{st.session_state.current_analysis_ifc}`")
+
+        # Generate and Save Excel button
+        if st.session_state.df is not None:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                if st.button("💾 Generer og lagre Excel",
+                           type="secondary",
+                           use_container_width=True,
+                           disabled=st.session_state.is_processing,
+                           help="Lagrer Excel-fil til output-mappen"):
+                    # Generate filename
+                    excel_path = st.session_state.sync.output_folder / f"{st.session_state.current_analysis_ifc.stem}.xlsx"
+
+                    # Save Excel
+                    success = st.session_state.sync.save_dataframe_to_excel(st.session_state.df, excel_path)
+
+                    if success:
+                        st.success(f"✅ Excel lagret: {excel_path}")
+                    else:
+                        st.error("❌ Kunne ikke lagre Excel")
+
+            with col2:
+                # Download current DataFrame as Excel (in-memory, no save)
+                from io import BytesIO
+                buffer = BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    st.session_state.df.to_excel(writer, sheet_name='Elements', index=False)
+                    worksheet = writer.sheets['Elements']
+                    for col in worksheet.columns:
+                        worksheet.column_dimensions[col[0].column_letter].width = 25
+                buffer.seek(0)
+
+                st.download_button(
+                    label="📥 Last ned Excel",
+                    data=buffer,
+                    file_name=f"{st.session_state.current_analysis_ifc.stem}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="Last ned Excel-fil direkte (lagres ikke på disk)",
+                    disabled=st.session_state.is_processing,
+                    use_container_width=True
+                )
+
+        # Download Analysis IFC
+        if st.session_state.current_analysis_ifc.exists():
+            with open(st.session_state.current_analysis_ifc, "rb") as f:
+                st.download_button(
+                    label="🏗️ Last ned Analyse-IFC",
+                    data=f,
+                    file_name=st.session_state.current_analysis_ifc.name,
+                    mime="application/octet-stream",
+                    help="Last ned oppdatert IFC-fil fra Skiplum demo-mappen",
+                    disabled=st.session_state.is_processing,
+                    use_container_width=True
+                )
 
 
 # =============================================================================
 # MAIN CONTENT
 # =============================================================================
 
-# Create tabs
-tab1, tab2, tab3 = st.tabs(["📊 Data View", "📈 LCA Analysis", "✏️ Edit Data"])
+# Create tabs - simplified to 2 main tabs
+tab1, tab2 = st.tabs(["📈 Klimagassanalyse", "✏️ Forbedre prosjektet"])
 
 # =============================================================================
-# TAB 1: DATA VIEW
+# TAB 1: LCA ANALYSIS (formerly TAB 2)
 # =============================================================================
 
 with tab1:
-    st.header("📊 IFC Data View")
-
-    if st.session_state.df is not None:
-        df = st.session_state.df
-
-        # Summary metrics
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric("Total Elements", len(df))
-
-        with col2:
-            unique_types = df['Entity'].nunique() if 'Entity' in df.columns else 0
-            st.metric("Element Types", unique_types)
-
-        with col3:
-            materials = df['Material'].nunique() if 'Material' in df.columns else 0
-            st.metric("Materials", materials)
-
-        with col4:
-            if '_source_file' in df.columns:
-                st.metric("Source File", df['_source_file'].iloc[0] if len(df) > 0 else "N/A")
-
-        st.markdown("---")
-
-        # Filters
-        st.subheader("🔍 Filters")
-
-        col_filter1, col_filter2 = st.columns(2)
-
-        with col_filter1:
-            if 'Entity' in df.columns:
-                entity_filter = st.multiselect(
-                    "Filter by Entity Type",
-                    options=sorted(df['Entity'].dropna().unique()),
-                    default=[]
-                )
-                if entity_filter:
-                    df = df[df['Entity'].isin(entity_filter)]
-
-        with col_filter2:
-            if 'Material' in df.columns:
-                material_filter = st.multiselect(
-                    "Filter by Material",
-                    options=sorted(df['Material'].dropna().unique()),
-                    default=[]
-                )
-                if material_filter:
-                    df = df[df['Material'].isin(material_filter)]
-
-        # Data table
-        st.subheader("📋 Element Data")
-
-        # Select columns to display
-        display_cols = st.multiselect(
-            "Select columns to display",
-            options=df.columns.tolist(),
-            default=['GUID', 'BIM_ID', 'Entity', 'Name', 'Type', 'Material'][:min(6, len(df.columns))]
-        )
-
-        if display_cols:
-            st.dataframe(df[display_cols], use_container_width=True, height=500)
-        else:
-            st.dataframe(df, use_container_width=True, height=500)
-
-    else:
-        st.info("👈 Load an IFC file or Excel file from the sidebar to get started")
-
-
-# =============================================================================
-# TAB 2: LCA ANALYSIS
-# =============================================================================
-
-with tab2:
     st.markdown('<p class="main-header">📈 Klimagassanalyse</p>', unsafe_allow_html=True)
-    st.markdown("### Analyse av volum fordelt på material og gjenbruksstatus")
 
     if st.session_state.df is not None:
         df = st.session_state.df.copy()
 
-        # Extract volume and MMI data
-        df = extract_volume_from_properties(df)
-        df = extract_mmi_code(df)
+        # Quick overview metrics at the top
+        col1, col2, col3, col4 = st.columns(4)
 
-        # Map MMI codes to readable status
-        df['MMI_Status'] = df['MMI_Code'].apply(map_mmi_to_status)
+        with col1:
+            st.metric("Totalt antall elementer", len(df))
+
+        with col2:
+            unique_types = df['Entity'].nunique() if 'Entity' in df.columns else 0
+            st.metric("Elementtyper", unique_types)
+
+        with col3:
+            materials = df['Material'].nunique() if 'Material' in df.columns else 0
+            st.metric("Materialer", materials)
+
+        with col4:
+            if '_source_file' in df.columns:
+                source_file = df['_source_file'].iloc[0] if len(df) > 0 else "N/A"
+                st.metric("Kildefil", Path(source_file).stem if source_file != "N/A" else "N/A")
+
+        st.markdown("---")
+        st.markdown("### Analyse av volum fordelt på material og gjenbruksstatus")
+
+        # Extract volume and Gjenbruksstatus
+        df = extract_volume_from_properties(df)
+        df = extract_gjenbruksstatus(df)
+
+        # Map status to display names
+        df['Status_Display'] = df['Gjenbruksstatus'].apply(map_status_to_display)
 
         # Calculate total volume
         total_volume = df['Volume_m3'].sum()
@@ -323,13 +419,13 @@ with tab2:
         col1, col2, col3 = st.columns(3)
 
         # Calculate percentages
-        ny_volume = df[df['MMI_Status'].str.contains('NY', na=False)]['Volume_m3'].sum()
+        ny_volume = df[df['Gjenbruksstatus'] == 'NY']['Volume_m3'].sum()
         ny_pct = (ny_volume / total_volume * 100) if total_volume > 0 else 0
 
-        eks_volume = df[df['MMI_Status'].str.contains('EKS', na=False)]['Volume_m3'].sum()
+        eks_volume = df[df['Gjenbruksstatus'] == 'EKS']['Volume_m3'].sum()
         eks_pct = (eks_volume / total_volume * 100) if total_volume > 0 else 0
 
-        gjen_volume = df[df['MMI_Status'].str.contains('GJEN', na=False)]['Volume_m3'].sum()
+        gjen_volume = df[df['Gjenbruksstatus'] == 'GJEN']['Volume_m3'].sum()
         gjen_pct = (gjen_volume / total_volume * 100) if total_volume > 0 else 0
 
         with col1:
@@ -407,53 +503,69 @@ with tab2:
             st.plotly_chart(fig_gjen, use_container_width=True)
             st.markdown(f"<div style='text-align:center; font-size:20px;'><b>{gjen_volume:,.1f} m³</b></div>", unsafe_allow_html=True)
 
-        # Impact statement
-        if gjen_pct > 20:
-            st.markdown(f"""
-            <div class="success-box">
-                🎉 FANTASTISK! Over {gjen_pct:.0f}% av volumet er gjenbruk - dette er bra for klimaet! 🌍
-            </div>
-            """, unsafe_allow_html=True)
+        # Enhanced impact narrative with clear problem/solution messaging
+        st.markdown("---")
+        st.markdown("### 📊 Klimaavtrykk-vurdering")
+
+        if gjen_pct > 30:
+            st.success(f"""
+**✅ FANTASTISK RESULTAT!**
+
+Over **{gjen_pct:.0f}% gjenbruk** - prosjektet har et betydelig redusert klimaavtrykk! Dette er et godt eksempel på sirkulær økonomi i praksis.
+
+**Miljøgevinst**: Dere har redusert CO₂-utslipp, ressursbruk og avfall sammenlignet med 100% nye materialer.
+            """)
         elif gjen_pct > 10:
-            st.markdown(f"""
-            <div style="background: linear-gradient(135deg, #FFB84D 0%, #FFA726 100%); padding: 1rem; border-radius: 8px; color: white; text-align: center; font-size: 1.2rem; margin: 1rem 0;">
-                👍 BRA! {gjen_pct:.0f}% gjenbruk - det er rom for forbedring
-            </div>
-            """, unsafe_allow_html=True)
+            st.warning(f"""
+**👍 BRA START - MEN ROM FOR FORBEDRING**
+
+Prosjektet har **{gjen_pct:.0f}% gjenbruk**, men det er potensiale for mer.
+
+**Anbefaling**: Gå til "Forbedre prosjektet" for å utforske hvilke elementer som kan konverteres til gjenbruk eller eksisterende materialer.
+            """)
+            st.info("💡 **NESTE STEG**: Prøv å endre betongvegger eller stålkonstruksjoner til gjenbruk - dette gir stor klimagevinst!")
         else:
-            st.markdown(f"""
-            <div style="background: linear-gradient(135deg, #FF6B6B 0%, #EE5A52 100%); padding: 1rem; border-radius: 8px; color: white; text-align: center; font-size: 1.2rem; margin: 1rem 0;">
-                ⚠️ Kun {gjen_pct:.0f}% gjenbruk - vurder å øke gjenbruksandelen
-            </div>
-            """, unsafe_allow_html=True)
+            st.error(f"""
+**❌ PROBLEM: HØY KLIMABELASTNING**
+
+Over **{ny_pct:.0f}% nye materialer** - dette gir høye klimagassutslipp og stor miljøbelastning.
+
+**Hvorfor er dette et problem?**
+- Nye materialer krever produksjon med høyt energiforbruk
+- Økte CO₂-utslipp sammenlignet med gjenbruk
+- Unødvendig ressursbruk når eksisterende/gjenbrukte alternativer finnes
+            """)
+            st.info(f"""
+**💡 LØSNING: Gå til "Forbedre prosjektet"-fanen**
+
+Ved å endre noen elementer til GJEN (gjenbruk) eller EKS (eksisterende) kan dere drastisk redusere klimaavtrykket.
+
+**Forslag til raske gevinster:**
+- Endre betongvegger til gjenbruk → stor CO₂-reduksjon
+- Behold eksisterende stålkonstruksjoner → kutt produksjonsutslipp
+- Gjenbruk av taktekking og fasadepaneler → mindre avfall
+            """)
 
         st.markdown("---")
 
-        # Group by Material and MMI Status
-        if 'Material' in df.columns:
-            # Create pivot table
-            pivot_data = df.groupby(['Material', 'MMI_Status'])['Volume_m3'].sum().reset_index()
-            pivot_data['Percentage'] = (pivot_data['Volume_m3'] / total_volume * 100)
-
-            # Sort by volume
-            pivot_data = pivot_data.sort_values('Volume_m3', ascending=False)
-
-            # Charts
-            col_chart1, col_chart2 = st.columns(2)
+        # Group by Material, Type, and Gjenbruksstatus
+        if 'Material' in df.columns and 'Entity' in df.columns:
+            # Charts - 3 columns
+            col_chart1, col_chart2, col_chart3 = st.columns(3)
 
             with col_chart1:
-                st.subheader("📊 Volume by MMI Status")
+                st.subheader("📊 Volum etter gjenbruksstatus")
 
-                # Pie chart of MMI status
-                mmi_totals = df.groupby('MMI_Status')['Volume_m3'].sum().reset_index()
-                mmi_totals = mmi_totals.sort_values('Volume_m3', ascending=False)
+                # Pie chart of status
+                status_totals = df.groupby('Status_Display')['Volume_m3'].sum().reset_index()
+                status_totals = status_totals.sort_values('Volume_m3', ascending=False)
 
                 fig_pie = px.pie(
-                    mmi_totals,
+                    status_totals,
                     values='Volume_m3',
-                    names='MMI_Status',
-                    title='Volume Distribution by MMI Code',
-                    color='MMI_Status',
+                    names='Status_Display',
+                    title='Volumfordeling etter gjenbruksstatus',
+                    color='Status_Display',
                     color_discrete_map={
                         'NY (Nytt)': '#FF6B6B',
                         'EKS (Eksisterende)': '#4ECDC4',
@@ -464,7 +576,26 @@ with tab2:
                 st.plotly_chart(fig_pie, use_container_width=True)
 
             with col_chart2:
-                st.subheader("📊 Volume by Material")
+                st.subheader("📊 Volum etter Type")
+
+                # Bar chart of element types
+                type_totals = df.groupby('Entity')['Volume_m3'].sum().reset_index()
+                type_totals = type_totals.sort_values('Volume_m3', ascending=False).head(10)
+
+                fig_type = px.bar(
+                    type_totals,
+                    x='Volume_m3',
+                    y='Entity',
+                    orientation='h',
+                    title='Topp 10 elementtyper etter volum',
+                    labels={'Volume_m3': 'Volum (m³)', 'Entity': 'Type'},
+                    color='Volume_m3',
+                    color_continuous_scale='Blues'
+                )
+                st.plotly_chart(fig_type, use_container_width=True)
+
+            with col_chart3:
+                st.subheader("📊 Volum etter materiale")
 
                 # Bar chart of materials
                 material_totals = df.groupby('Material')['Volume_m3'].sum().reset_index()
@@ -475,8 +606,8 @@ with tab2:
                     x='Volume_m3',
                     y='Material',
                     orientation='h',
-                    title='Top 10 Materials by Volume',
-                    labels={'Volume_m3': 'Volume (m³)', 'Material': 'Material'},
+                    title='Topp 10 materialer etter volum',
+                    labels={'Volume_m3': 'Volum (m³)', 'Material': 'Materiale'},
                     color='Volume_m3',
                     color_continuous_scale='Viridis'
                 )
@@ -484,93 +615,463 @@ with tab2:
 
             st.markdown("---")
 
-            # Detailed breakdown
-            st.subheader("📋 Volume Breakdown by Material and MMI Code")
+            # Detailed breakdowns - converted to expanders
+            st.subheader("📋 Detaljerte volumfordelinger")
+            st.caption("Klikk for å utvide hver analyse")
 
-            # Create stacked bar chart
-            fig_stacked = px.bar(
-                pivot_data,
-                x='Material',
-                y='Volume_m3',
-                color='MMI_Status',
-                title='Volume by Material and MMI Status',
-                labels={'Volume_m3': 'Volume (m³)', 'Material': 'Material'},
-                color_discrete_map={
-                    'NY (Nytt)': '#FF6B6B',
-                    'EKS (Eksisterende)': '#4ECDC4',
-                    'GJEN (Gjenbruk)': '#95E1D3',
-                    'Ikke angitt': '#CCCCCC'
-                },
-                barmode='stack'
-            )
-            fig_stacked.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_stacked, use_container_width=True)
+            # Breakdown 1: Type × Status
+            with st.expander("📊 Volum etter elementtype og gjenbruksstatus", expanded=False):
+                st.markdown("#### Volum etter elementtype og gjenbruksstatus")
 
-            # Data table
-            st.subheader("📊 Detailed Data")
+                # Type × Status pivot
+                type_pivot = df.groupby(['Entity', 'Status_Display'])['Volume_m3'].sum().reset_index()
+                type_pivot['Percentage'] = (type_pivot['Volume_m3'] / total_volume * 100)
+                type_pivot = type_pivot.sort_values('Volume_m3', ascending=False)
 
-            # Pivot table for display
-            pivot_display = pivot_data.copy()
-            pivot_display['Volume (m³)'] = pivot_display['Volume_m3'].round(2)
-            pivot_display['Percentage (%)'] = pivot_display['Percentage'].round(2)
+                # Stacked bar chart
+                fig_type_stacked = px.bar(
+                    type_pivot,
+                    x='Entity',
+                    y='Volume_m3',
+                    color='Status_Display',
+                    title='Volum etter elementtype og gjenbruksstatus',
+                    labels={'Volume_m3': 'Volum (m³)', 'Entity': 'Elementtype', 'Status_Display': 'Status'},
+                    color_discrete_map={
+                        'NY (Nytt)': '#FF6B6B',
+                        'EKS (Eksisterende)': '#4ECDC4',
+                        'GJEN (Gjenbruk)': '#95E1D3',
+                        'Ikke angitt': '#CCCCCC'
+                    },
+                    barmode='stack'
+                )
+                fig_type_stacked.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig_type_stacked, use_container_width=True)
 
-            st.dataframe(
-                pivot_display[['Material', 'MMI_Status', 'Volume (m³)', 'Percentage (%)']],
-                use_container_width=True,
-                height=400
-            )
+                # Data table
+                type_display = type_pivot.copy()
+                type_display['Volum (m³)'] = type_display['Volume_m3'].round(2)
+                type_display['Prosent (%)'] = type_display['Percentage'].round(2)
 
-            # Download pivot table
-            st.download_button(
-                label="📥 Download Pivot Table (CSV)",
-                data=pivot_display.to_csv(index=False),
-                file_name="lca_analysis_pivot.csv",
-                mime="text/csv"
-            )
+                st.dataframe(
+                    type_display[['Entity', 'Status_Display', 'Volum (m³)', 'Prosent (%)']],
+                    use_container_width=True,
+                    height=400
+                )
+
+                # Download button
+                st.download_button(
+                    label="📥 Last ned Type × Status (CSV)",
+                    data=type_display.to_csv(index=False),
+                    file_name="lca_type_status.csv",
+                    mime="text/csv"
+                )
+
+            # Breakdown 2: Materiale × Status
+            with st.expander("📊 Volum etter materiale og gjenbruksstatus", expanded=False):
+                st.markdown("#### Volum etter materiale og gjenbruksstatus")
+
+                # Material × Status pivot
+                material_pivot = df.groupby(['Material', 'Status_Display'])['Volume_m3'].sum().reset_index()
+                material_pivot['Percentage'] = (material_pivot['Volume_m3'] / total_volume * 100)
+                material_pivot = material_pivot.sort_values('Volume_m3', ascending=False)
+
+                # Stacked bar chart
+                fig_material_stacked = px.bar(
+                    material_pivot,
+                    x='Material',
+                    y='Volume_m3',
+                    color='Status_Display',
+                    title='Volum etter materiale og gjenbruksstatus',
+                    labels={'Volume_m3': 'Volum (m³)', 'Material': 'Materiale', 'Status_Display': 'Status'},
+                    color_discrete_map={
+                        'NY (Nytt)': '#FF6B6B',
+                        'EKS (Eksisterende)': '#4ECDC4',
+                        'GJEN (Gjenbruk)': '#95E1D3',
+                        'Ikke angitt': '#CCCCCC'
+                    },
+                    barmode='stack'
+                )
+                fig_material_stacked.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig_material_stacked, use_container_width=True)
+
+                # Data table
+                material_display = material_pivot.copy()
+                material_display['Volum (m³)'] = material_display['Volume_m3'].round(2)
+                material_display['Prosent (%)'] = material_display['Percentage'].round(2)
+
+                st.dataframe(
+                    material_display[['Material', 'Status_Display', 'Volum (m³)', 'Prosent (%)']],
+                    use_container_width=True,
+                    height=400
+                )
+
+                # Download button
+                st.download_button(
+                    label="📥 Last ned Materiale × Status (CSV)",
+                    data=material_display.to_csv(index=False),
+                    file_name="lca_material_status.csv",
+                    mime="text/csv"
+                )
+
+            # Breakdown 3: Type × Materiale × Status
+            with st.expander("📊 Volum etter type, materiale og gjenbruksstatus", expanded=False):
+                st.markdown("#### Volum etter type, materiale og gjenbruksstatus")
+
+                # Type × Material × Status pivot
+                full_pivot = df.groupby(['Entity', 'Material', 'Status_Display'])['Volume_m3'].sum().reset_index()
+                full_pivot['Percentage'] = (full_pivot['Volume_m3'] / total_volume * 100)
+                full_pivot = full_pivot.sort_values('Volume_m3', ascending=False)
+
+                # Display as table (too complex for chart)
+                full_display = full_pivot.copy()
+                full_display['Volum (m³)'] = full_display['Volume_m3'].round(2)
+                full_display['Prosent (%)'] = full_display['Percentage'].round(2)
+
+                st.dataframe(
+                    full_display[['Entity', 'Material', 'Status_Display', 'Volum (m³)', 'Prosent (%)']],
+                    use_container_width=True,
+                    height=500
+                )
+
+                # Download button
+                st.download_button(
+                    label="📥 Last ned Type × Materiale × Status (CSV)",
+                    data=full_display.to_csv(index=False),
+                    file_name="lca_full_pivot.csv",
+                    mime="text/csv"
+                )
 
         else:
-            st.warning("No Material column found in data")
+            st.warning("Ingen materialkolonne funnet i dataene")
 
     else:
-        st.info("👈 Load an IFC file or Excel file from the sidebar to get started")
+        st.info("👈 Last inn en IFC-fil eller Excel-fil fra sidepanelet for å komme i gang")
 
 
 # =============================================================================
-# TAB 3: EDIT DATA
+# TAB 2: EDIT DATA (formerly TAB 3)
 # =============================================================================
 
-with tab3:
-    st.header("✏️ Edit Element Data")
+with tab2:
+    st.header("✏️ Forbedre prosjektet")
+    st.markdown("**Endre gjenbruksstatus for å redusere klimaavtrykket**")
 
     if st.session_state.df is not None:
-        df = st.session_state.df
+        df = st.session_state.df.copy()
 
-        st.info("💡 Edit cells directly in the table below. Changes will be saved when you sync to IFC.")
+        # Ensure G55_LCA.Gjenbruksstatus column exists
+        gjenbruk_col = 'G55_LCA.Gjenbruksstatus'
+        if gjenbruk_col not in df.columns:
+            df[gjenbruk_col] = 'NY'
+            st.warning("⚠️ Gjenbruksstatus-kolonne mangler. La til med standardverdier (NY).")
 
-        # Editable data editor
-        edited_df = st.data_editor(
-            df,
-            use_container_width=True,
-            height=600,
-            num_rows="dynamic",  # Allow adding/deleting rows
-            key="data_editor"
+        # Demo scenarios - one-click preset changes
+        st.subheader("📖 Demo-scenarier")
+        st.caption("Klikk for å vise raske klimaforbedringer (endringer lagres automatisk)")
+
+        col_scenario1, col_scenario2, col_scenario3 = st.columns(3)
+
+        with col_scenario1:
+            if st.button("🏗️ Gjenbruk betongvegger", type="secondary", use_container_width=True):
+                # Filter: Walls with Concrete
+                if 'Entity' in df.columns and 'Material' in df.columns:
+                    mask = (df['Entity'].str.contains('Wall', case=False, na=False)) & \
+                           (df['Material'].str.contains('Concrete|Betong', case=False, na=False))
+                    affected = mask.sum()
+                    df.loc[mask, gjenbruk_col] = 'GJEN'
+                    st.session_state.df = df
+
+                    # Update analysis IFC directly (fast, Solibri sees changes immediately)
+                    if st.session_state.current_analysis_ifc:
+                        with st.spinner("Oppdaterer IFC-fil..."):
+                            st.session_state.sync.update_ifc_from_dataframe(df, st.session_state.current_analysis_ifc)
+
+                    st.success(f"✅ Endret {affected} betongvegger til GJENBRUK!")
+                    if st.session_state.is_cloud:
+                        st.info("💡 Gå til 'Klimagassanalyse' for å se effekten | Last ned IFC for å bruke i Solibri")
+                    else:
+                        st.info("💡 Gå til 'Klimagassanalyse' for å se effekten | Solibri vil vise oppdateringsprompt")
+                    st.rerun()
+
+        with col_scenario2:
+            if st.button("🌳 Behold eksisterende stål", type="secondary", use_container_width=True):
+                # Filter: Elements with Steel/Stål
+                if 'Material' in df.columns:
+                    mask = df['Material'].str.contains('Steel|Stål', case=False, na=False)
+                    affected = mask.sum()
+                    df.loc[mask, gjenbruk_col] = 'EKS'
+                    st.session_state.df = df
+
+                    # Update analysis IFC directly (fast, Solibri sees changes immediately)
+                    if st.session_state.current_analysis_ifc:
+                        with st.spinner("Oppdaterer IFC-fil..."):
+                            st.session_state.sync.update_ifc_from_dataframe(df, st.session_state.current_analysis_ifc)
+
+                    st.success(f"✅ Endret {affected} stålelementer til EKSISTERENDE!")
+                    st.info("💡 Gå til 'Klimagassanalyse' for å se effekten | Solibri vil vise oppdateringsprompt")
+                    st.rerun()
+
+        with col_scenario3:
+            if st.button("♻️ Gjenbruk alle dekker", type="secondary", use_container_width=True):
+                # Filter: Slabs
+                if 'Entity' in df.columns:
+                    mask = df['Entity'].str.contains('Slab|Dekke', case=False, na=False)
+                    affected = mask.sum()
+                    df.loc[mask, gjenbruk_col] = 'GJEN'
+                    st.session_state.df = df
+
+                    # Update analysis IFC directly (fast, Solibri sees changes immediately)
+                    if st.session_state.current_analysis_ifc:
+                        with st.spinner("Oppdaterer IFC-fil..."):
+                            st.session_state.sync.update_ifc_from_dataframe(df, st.session_state.current_analysis_ifc)
+
+                    st.success(f"✅ Endret {affected} dekker til GJENBRUK!")
+                    st.info("💡 Gå til 'Klimagassanalyse' for å se effekten | Solibri vil vise oppdateringsprompt")
+                    st.rerun()
+
+        # Reset button
+        col_reset1, col_reset2, col_reset3 = st.columns([1, 1, 1])
+        with col_reset2:
+            if st.button("🔄 Tilbakestill alle til NY", type="secondary", use_container_width=True):
+                df[gjenbruk_col] = 'NY'
+                st.session_state.df = df
+
+                # Update analysis IFC directly
+                if st.session_state.current_analysis_ifc:
+                    with st.spinner("Oppdaterer IFC-fil..."):
+                        st.session_state.sync.update_ifc_from_dataframe(df, st.session_state.current_analysis_ifc)
+
+                st.warning("⚠️ Tilbakestilt alle elementer til NYE | Solibri vil vise oppdateringsprompt")
+                st.rerun()
+
+        st.markdown("---")
+
+        # Main editing interface (formerly "Rask redigering")
+        st.subheader("🎯 Manuell redigering")
+        st.info("💡 Filtrer elementer og sett gjenbruksstatus manuelt")
+
+        # Primary filter - always visible
+        entity_options = ['Alle'] + sorted(df['Entity'].dropna().unique().tolist())
+        selected_entity = st.selectbox(
+            "📋 Filtrer etter elementtype",
+            options=entity_options,
+            key="entity_filter_edit",
+            help="Velg hvilken type elementer du vil endre"
         )
 
-        # Save edited data back to session state
-        if st.button("💾 Save Changes to Session", type="primary"):
-            st.session_state.df = edited_df
-            st.success("✅ Changes saved to session. Use sidebar to sync to IFC.")
+        # Additional filters - hidden by default (progressive disclosure)
+        with st.expander("🔍 Flere filtre (Materiale, Etasje, Sone)", expanded=False):
+            col_f1, col_f2 = st.columns(2)
 
-        # Export to Excel
-        if st.button("📥 Export to Excel"):
-            script_dir = Path(__file__).parent
-            output_path = script_dir / "output" / "edited_data.xlsx"
-            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                edited_df.to_excel(writer, sheet_name='Elements', index=False)
-            st.success(f"✅ Exported to {output_path}")
+            with col_f1:
+                material_options = ['Alle'] + sorted(df['Material'].dropna().unique().tolist())
+                selected_material = st.selectbox(
+                    "Materiale",
+                    options=material_options,
+                    key="material_filter_edit"
+                )
+
+                if 'Floor' in df.columns:
+                    floor_options = ['Alle'] + sorted([str(f) for f in df['Floor'].dropna().unique().tolist()])
+                    selected_floor = st.selectbox(
+                        "Etasje",
+                        options=floor_options,
+                        key="floor_filter_edit"
+                    )
+                else:
+                    selected_floor = 'Alle'
+
+            with col_f2:
+                if 'Zone' in df.columns:
+                    zone_options = ['Alle'] + sorted([str(z) for z in df['Zone'].dropna().unique().tolist()])
+                    selected_zone = st.selectbox(
+                        "Sone/Rom",
+                        options=zone_options,
+                        key="zone_filter_edit"
+                    )
+                else:
+                    selected_zone = 'Alle'
+
+        # If expander not used, set defaults
+        if 'selected_material' not in locals():
+            selected_material = 'Alle'
+        if 'selected_floor' not in locals():
+            selected_floor = 'Alle'
+        if 'selected_zone' not in locals():
+            selected_zone = 'Alle'
+
+        # Apply filters
+        filtered_df = df.copy()
+        if selected_entity != 'Alle':
+            filtered_df = filtered_df[filtered_df['Entity'] == selected_entity]
+        if selected_material != 'Alle':
+            filtered_df = filtered_df[filtered_df['Material'] == selected_material]
+        if selected_floor != 'Alle' and 'Floor' in df.columns:
+            filtered_df = filtered_df[filtered_df['Floor'].astype(str) == selected_floor]
+        if selected_zone != 'Alle' and 'Zone' in df.columns:
+            filtered_df = filtered_df[filtered_df['Zone'].astype(str) == selected_zone]
+
+        st.markdown(f"**{len(filtered_df)} elementer** matcher filter")
+
+        # Show current distribution
+        st.markdown("### Nåværende fordeling:")
+        col_dist1, col_dist2, col_dist3 = st.columns(3)
+
+        ny_count = (filtered_df[gjenbruk_col] == 'NY').sum()
+        eks_count = (filtered_df[gjenbruk_col] == 'EKS').sum()
+        gjen_count = (filtered_df[gjenbruk_col] == 'GJEN').sum()
+
+        with col_dist1:
+            st.metric("🔴 NYTT", ny_count)
+        with col_dist2:
+            st.metric("🟡 EKSISTERENDE", eks_count)
+        with col_dist3:
+            st.metric("🟢 GJENBRUK", gjen_count)
+
+        st.markdown("---")
+
+        # Bulk edit section
+        st.subheader("Velg ny gjenbruksstatus for filtrerte elementer:")
+
+        # Single edit option - only Gjenbruksstatus matters
+        new_status = st.selectbox(
+            "Gjenbruksstatus",
+            options=['(Ikke endre)', 'NY', 'EKS', 'GJEN'],
+            index=0,
+            key="new_status_select",
+            help="Velg hvilken status de filtrerte elementene skal få"
+        )
+
+        if st.button("✅ Oppdater valgte elementer", type="primary"):
+            # Update the filtered rows
+            mask = df.index.isin(filtered_df.index)
+
+            if new_status != '(Ikke endre)':
+                df.loc[mask, gjenbruk_col] = new_status
+                # Update session state
+                st.session_state.df = df
+
+                # Update analysis IFC directly (fast, Solibri sees changes immediately)
+                if st.session_state.current_analysis_ifc:
+                    with st.spinner("Oppdaterer IFC-fil..."):
+                        st.session_state.sync.update_ifc_from_dataframe(df, st.session_state.current_analysis_ifc)
+
+                st.success(f"✅ Oppdatert {len(filtered_df)} elementer til {new_status} | Solibri vil vise oppdateringsprompt")
+                st.rerun()
+            else:
+                st.warning("⚠️ Velg en gjenbruksstatus")
+
+        # Preview table - simplified to show only what matters
+        st.markdown("### Forhåndsvisning av filtrerte elementer:")
+
+        # Show only essential columns
+        preview_cols = ['Entity', 'Material', gjenbruk_col]
+
+        # Optionally show original MMI for reference
+        original_mmi_col = 'G55_LCA.Original_MMI'
+        if original_mmi_col in filtered_df.columns:
+            preview_cols.append(original_mmi_col)
+
+        available_cols = [col for col in preview_cols if col in filtered_df.columns]
+
+        st.dataframe(
+            filtered_df[available_cols],
+            use_container_width=True,
+            height=300
+        )
+
+        # Optional: Show more details in expander
+        with st.expander("📋 Vis flere detaljer (Name, Floor, Zone)"):
+            detail_cols = ['Name', 'Floor', 'Zone'] + available_cols
+            detail_cols_available = [col for col in detail_cols if col in filtered_df.columns]
+            st.dataframe(
+                filtered_df[detail_cols_available],
+                use_container_width=True,
+                height=300
+            )
+
+        st.markdown("---")
+
+        # Advanced editor (formerly edit_tab2) - now in expander for power users
+        with st.expander("🔧 Avansert redigering (full tabell)", expanded=False):
+            st.info("💡 Rediger gjenbruksstatus direkte i tabellen. Original IFC-data er synlig men kan ikke endres her.")
+
+            # Editable data editor with proper column configuration - simplified
+            column_config = {
+                gjenbruk_col: st.column_config.SelectboxColumn(
+                    "Gjenbruksstatus",
+                    help="Velg gjenbruksstatus (NY/EKS/GJEN)",
+                    options=["NY", "EKS", "GJEN"],
+                    required=True
+                ),
+                'G55_LCA.Original_MMI': st.column_config.TextColumn(
+                    "Original MMI",
+                    help="Original MMI-verdi fra IFC (kun visning)",
+                    disabled=True
+                ),
+                'Material': st.column_config.TextColumn(
+                    "Material (IFC)",
+                    help="Original materiale fra IFC (kun visning)",
+                    disabled=True
+                ),
+                'Entity': st.column_config.TextColumn(
+                    "Entity (IFC)",
+                    help="Original elementtype fra IFC (kun visning)",
+                    disabled=True
+                ),
+                'Floor': st.column_config.TextColumn(
+                    "Floor",
+                    help="Etasje (kun visning)",
+                    disabled=True
+                ),
+                'Zone': st.column_config.TextColumn(
+                    "Zone",
+                    help="Sone/Rom (kun visning)",
+                    disabled=True
+                )
+            }
+
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                height=500,
+                num_rows="dynamic",
+                key="data_editor",
+                column_config=column_config
+            )
+
+            # Save changes
+            col_save1, col_save2 = st.columns(2)
+
+            with col_save1:
+                if st.button("💾 Lagre alle endringer", type="primary"):
+                    st.session_state.df = edited_df
+
+                    # Update analysis IFC directly (fast, Solibri sees changes immediately)
+                    if st.session_state.current_analysis_ifc:
+                        with st.spinner("Oppdaterer IFC-fil..."):
+                            st.session_state.sync.update_ifc_from_dataframe(edited_df, st.session_state.current_analysis_ifc)
+                        st.success("✅ Endringer lagret til IFC! Solibri vil vise oppdateringsprompt")
+                    else:
+                        st.success("✅ Endringer lagret i session")
+
+            with col_save2:
+                # Download edited data as Excel
+                from io import BytesIO
+                buffer = BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    edited_df.to_excel(writer, sheet_name='Elements', index=False)
+                buffer.seek(0)
+
+                st.download_button(
+                    label="📥 Last ned redigert Excel",
+                    data=buffer,
+                    file_name="redigerte_data.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 
     else:
-        st.info("👈 Load an IFC file or Excel file from the sidebar to get started")
+        st.info("👈 Last inn en IFC-fil eller Excel-fil fra sidepanelet for å komme i gang")
 
 
 # =============================================================================
@@ -578,4 +1079,4 @@ with tab3:
 # =============================================================================
 
 st.markdown("---")
-st.caption("🏗️ BIM LCA Sync Dashboard | Built with Streamlit & IfcOpenShell")
+st.caption("🏗️ BIM LCA Synkronisering | Laget med Streamlit & IfcOpenShell")

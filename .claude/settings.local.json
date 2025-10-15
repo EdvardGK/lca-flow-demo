@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(command -v git:*)",
-      "Bash(whereis:*)"
+      "Bash(whereis:*)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": []

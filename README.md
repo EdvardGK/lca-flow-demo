@@ -9,13 +9,22 @@ No Dalux dependency. Works with local files. Use with Solibri for visualization.
 
 ## 🎯 What It Does
 
-1. **Extract**: IFC elements → Excel spreadsheet
+1. **Extract**: IFC elements → Excel spreadsheet with **real-time progress tracking**
 2. **Enhance**: Creates analysis IFC copy with custom property sets (G55_Prosjektinfo, G55_LCA)
 3. **Edit**: Modify LCA data in Excel (Gjenbruksstatus, CO2_kg, etc.)
 4. **Sync**: Update analysis IFC with Excel edits
 5. **Analyze**: Streamlit dashboard with LCA analytics and pivot tables
 
 **Result**: Clean workflow from IFC model → Excel editing → Analysis IFC for Solibri
+
+### ✨ New Features
+
+- **Progress Tracking**: Real-time progress bars and status updates during extraction
+- **State Management**: Prevents interruptions - buttons disable during processing
+- **Cloud Ready**: File upload/download - works on any computer via Streamlit Cloud
+- **Norwegian Interface**: All user-facing text in Norwegian
+- **Smart Editing**: Dedicated UI for editing Gjenbruksstatus (NY/EKS/GJEN) with bulk operations
+- **Demo-Friendly**: Quick edit mode perfect for live demonstrations
 
 ---
 
@@ -319,3 +328,10 @@ streamlit run streamlit_dashboard.py
 ```
 
 **That's it!** Simple workflow, powerful results. 🎉
+
+## 📖 Additional Documentation
+
+- **[EDITING_GUIDE.md](EDITING_GUIDE.md)** - Complete guide to editing Gjenbruksstatus values
+- **[PROGRESS_TRACKING.md](PROGRESS_TRACKING.md)** - Details on progress indicators and state management
+- **[DEPLOY.md](DEPLOY.md)** - Streamlit Cloud deployment guide
+- **[QUICKSTART.md](QUICKSTART.md)** - Get running in 5 minutes

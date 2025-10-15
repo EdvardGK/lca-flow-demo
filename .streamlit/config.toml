@@ -1,0 +1,23 @@
+# Streamlit Cloud Configuration
+# =============================
+
+[theme]
+primaryColor = "#2E7D32"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"
+font = "sans serif"
+
+[server]
+# Allow larger file uploads (in MB)
+maxUploadSize = 500
+
+# Disable CORS for cloud deployment
+enableCORS = false
+
+# Allow websocket compression for better performance
+enableWebsocketCompression = true
+
+[browser]
+# Automatically open browser when running locally
+gatherUsageStats = false
