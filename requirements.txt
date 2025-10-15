@@ -1,0 +1,16 @@
+# POC IFC-Excel Sync Requirements
+# =================================
+
+# Core IFC processing
+ifcopenshell>=0.7.0
+
+# Data manipulation
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Streamlit dashboard
+streamlit>=1.28.0
+plotly>=5.18.0
+
+# Additional visualization
+altair>=5.0.0
